@@ -25,7 +25,8 @@ REVIEW_COLUMNS = [
     "信頼度", "要確認", "X中心(%)", "Y中心(%)", "左端(px)", "右端(px)",
 ]
 META_COLUMNS = ["項目", "値"]
-DEFAULT_SHIFT_TOKENS = "D1,D2,休,M,A,B,C,夜,明,早,遅,日,有休,有,公,欠,研,代,半休,○,〇,×,-"
+DEFAULT_SHIFT_TOKENS = "D,d,D+,d+,M,m,ME,me,SH,sh,B,b,C,c,A,a,A+,a+,J_,j,-,-c,/,/A,/B,/G,/I,/K,/M,/O,/R,/S,/X,/Y,HS,D2,d2,D3,d3,D4,d4,K,k,K2,k2,M1,m1,S,s,SA,sa,SB,sb,SD,sd,A1,a1,A2,a2,B1,b1,B2,b2,Q,q,Q1,q1,J1,j1,J2,j2,DI,di,JI,ji,K1,k1,M2,m2,M3,m3,MI,mi,P,p,P0,p0,P1,p1,P2,p2,S1,s1,S2,s2,S3,s3,SO,so,A5,a5,A6,a6,A_,a_,S0,s0,B3,b3,B5,b5,B_,b_,E,e,E2,e2,P3,p3,R,r,D1,d1,J,j,J3,j3,D7,d7,D8,d8,DH,dh,H6,h6,N6,n6,T6,t6,A3,a3,AS,as,3Q,3q,4Q,4q,R1,r1,R2,r2,R5,r5,R6,r6,R7,r7,Q2,q2,DA,da,J4,j4,J7,j7,F,f,F1,f1,F2,f2,G,g,B',b',H,h,I,i,L,l,T,t,H1,h1,D6,d6,DP,dp,DY,dy,MB,mb,B4,b4,J5,j5,JA,ja,JD,jd,Z,z,D5,d5,BS,bs,1Q,1q,A9,a9,AE,ae,E6,e6,2B,2b,DS,ds,E1,e1,M4,m4,N,n,A4,a4,AF,af,BF,bf,F4,f4,C3,c3,G1,g1,G2,g2,K3,k3,C1,c1,C_,c_,1A,1a,CM,cm,S6,s6,AL,al,K4,k4,N5,n5,S4,s4,S5,s5,U1,u1
+"
 HEADER_NAMES = {"氏名", "職員名", "従業員名", "名前", "職員", "従業員", "スタッフ", "name", "employee"}
 
 

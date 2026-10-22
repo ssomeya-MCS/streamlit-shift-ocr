@@ -3,36 +3,64 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import io
+import json
+import math
+import numbers
 import re
-import statistics
 import unicodedata
 from typing import Any
 
 import numpy as np
 import pandas as pd
 import streamlit as st
-from PIL import Image, ImageOps
+from PIL import Image, ImageDraw, ImageOps
 from pdf2image import convert_from_bytes, pdfinfo_from_bytes
 from paddleocr import PaddleOCR
 
-
-APP_TITLE = "手書き勤務シフト表 OCR"
+APP_TITLE = "手書き勤務シフト表 OCR（固定レイアウト）"
 MAX_PDF_PAGES = 5
 LOW_CONFIDENCE = 0.85
 SCHEDULE_COLUMNS = ["氏名"] + [f"{day}日" for day in range(1, 32)]
-REVIEW_COLUMNS = [
-    "ページ", "OCR行", "分類", "推定氏名", "推定日", "認識テキスト",
-    "信頼度", "要確認", "X中心(%)", "Y中心(%)", "左端(px)", "右端(px)",
-]
+REVIEW_COLUMNS = ["ページ", "行番号", "項目", "日付", "OCR結果", "信頼度", "判定", "セル位置"]
 META_COLUMNS = ["項目", "値"]
-DEFAULT_SHIFT_TOKENS = "D,d,D+,d+,M,m,ME,me,SH,sh,B,b,C,c,A,a,A+,a+,J_,j,-,-c,/,/A,/B,/G,/I,/K,/M,/O,/R,/S,/X,/Y,HS,D2,d2,D3,d3,D4,d4,K,k,K2,k2,M1,m1,S,s,SA,sa,SB,sb,SD,sd,A1,a1,A2,a2,B1,b1,B2,b2,Q,q,Q1,q1,J1,j1,J2,j2,DI,di,JI,ji,K1,k1,M2,m2,M3,m3,MI,mi,P,p,P0,p0,P1,p1,P2,p2,S1,s1,S2,s2,S3,s3,SO,so,A5,a5,A6,a6,A_,a_,S0,s0,B3,b3,B5,b5,B_,b_,E,e,E2,e2,P3,p3,R,r,D1,d1,J,j,J3,j3,D7,d7,D8,d8,DH,dh,H6,h6,N6,n6,T6,t6,A3,a3,AS,as,3Q,3q,4Q,4q,R1,r1,R2,r2,R5,r5,R6,r6,R7,r7,Q2,q2,DA,da,J4,j4,J7,j7,F,f,F1,f1,F2,f2,G,g,B',b',H,h,I,i,L,l,T,t,H1,h1,D6,d6,DP,dp,DY,dy,MB,mb,B4,b4,J5,j5,JA,ja,JD,jd,Z,z,D5,d5,BS,bs,1Q,1q,A9,a9,AE,ae,E6,e6,2B,2b,DS,ds,E1,e1,M4,m4,N,n,A4,a4,AF,af,BF,bf,F4,f4,C3,c3,G1,g1,G2,g2,K3,k3,C1,c1,C_,c_,1A,1a,CM,cm,S6,s6,AL,al,K4,k4,N5,n5,S4,s4,S5,s5,U1,u1"
+DEFAULT_SHIFT_TOKENS = "D1,D2,休,M,A,B,C,夜,明,早,遅,日,有休,有,公,欠,研,代,半休,○,〇,×,-"
 HEADER_NAMES = {"氏名", "職員名", "従業員名", "名前", "職員", "従業員", "スタッフ", "name", "employee"}
+
+# UI widgets use these keys so template settings can be loaded from/saved to JSON.
+CONFIG_DEFAULTS = {
+    "day1_center_pct": 18.0,
+    "day31_center_pct": 98.0,
+    "name_left_pct": 1.0,
+    "name_right_pct": 15.0,
+    "first_row_center_pct": 24.0,
+    "row_step_pct": 2.5,
+    "row_count": 25,
+    "row_crop_ratio": 0.72,
+    "upscale": 3,
+    "enhance_contrast": True,
+    "binarize": False,
+    "dpi": 300,
+}
+CONFIG_LABELS = {
+    "day1_center_pct": "1日列の中心X位置（画像の左から%）",
+    "day31_center_pct": "31日列の中心X位置（画像の左から%）",
+    "name_left_pct": "氏名欄の左端X位置（%）",
+    "name_right_pct": "氏名欄の右端X位置（%）",
+    "first_row_center_pct": "最初の職員行の中心Y位置（上から%）",
+    "row_step_pct": "職員行の間隔（画像高さに対する%）",
+    "row_count": "読み取る職員行数",
+    "row_crop_ratio": "行セルの縦方向の切り出し幅（行間隔に対する比率）",
+    "upscale": "文字画像の拡大倍率",
+    "enhance_contrast": "文字のコントラストを補正",
+    "binarize": "白黒2値化する（文字が薄くなる場合はオフ）",
+    "dpi": "PDFの画像化解像度（DPI）",
+}
 
 
 @st.cache_resource(show_spinner=False)
 def get_ocr_engine() -> PaddleOCR:
-    """PaddleOCR 2.10系の日本語モデル。モデルは初回にダウンロードされる。"""
-    return PaddleOCR(use_angle_cls=True, lang="japan", use_gpu=False, show_log=False)
+    """CPU版PaddleOCR 2.10の日本語モデルを初期化。"""
+    return PaddleOCR(use_angle_cls=False, lang="japan", use_gpu=False, show_log=False)
 
 
 def load_images(file_bytes: bytes, filename: str, dpi: int) -> tuple[list[Image.Image], int, int]:
@@ -44,11 +72,8 @@ def load_images(file_bytes: bytes, filename: str, dpi: int) -> tuple[list[Image.
         if total_pages < 1:
             raise ValueError("PDFからページ数を取得できません。PDFが破損していないか確認してください。")
         count = min(total_pages, MAX_PDF_PAGES)
-        pages = convert_from_bytes(
-            file_bytes, dpi=dpi, first_page=1, last_page=count,
-            fmt="png", thread_count=1,
-        )
-        return [im.convert("RGB") for im in pages], total_pages, len(pages)
+        pages = convert_from_bytes(file_bytes, dpi=dpi, first_page=1, last_page=count, fmt="png", thread_count=1)
+        return [ImageOps.exif_transpose(im).convert("RGB") for im in pages], total_pages, len(pages)
 
     try:
         with Image.open(io.BytesIO(file_bytes)) as im:
@@ -57,481 +82,340 @@ def load_images(file_bytes: bytes, filename: str, dpi: int) -> tuple[list[Image.
         raise ValueError(f"画像を読み込めませんでした: {exc}") from exc
 
 
-def extract_detections(result: Any, page_no: int, width: int, height: int) -> list[dict[str, Any]]:
-    """PaddleOCR 2.xの戻り値からテキスト、信頼度、バウンディングボックスを抽出。"""
-    detections: list[dict[str, Any]] = []
-    if not result or not isinstance(result, list):
-        return detections
-    page_items = result[0] if result else None
-    if not page_items:
-        return detections
-
-    for item in page_items:
-        if not item or len(item) < 2:
-            continue
-        box, recognition = item[0], item[1]
-        if not recognition or len(recognition) < 2:
-            continue
-        text = str(recognition[0]).strip()
-        if not text:
-            continue
-        try:
-            score = float(recognition[1])
-            points = np.asarray(box, dtype=float).reshape(-1, 2)
-        except (TypeError, ValueError):
-            continue
-        if points.size == 0:
-            continue
-        x_min, y_min = float(points[:, 0].min()), float(points[:, 1].min())
-        x_max, y_max = float(points[:, 0].max()), float(points[:, 1].max())
-        detections.append({
-            "page": page_no,
-            "text": text,
-            "score": score,
-            "x_min": x_min,
-            "y_min": y_min,
-            "x_max": x_max,
-            "y_max": y_max,
-            "center_x": (x_min + x_max) / 2,
-            "center_y": (y_min + y_max) / 2,
-            "width": max(1.0, x_max - x_min),
-            "height": max(1.0, y_max - y_min),
-            "image_width": width,
-            "image_height": height,
-        })
-    return detections
+def get_config() -> dict[str, Any]:
+    return {key: st.session_state.get(f"cfg_{key}", default) for key, default in CONFIG_DEFAULTS.items()}
 
 
-def normalized_text(text: str) -> str:
-    return unicodedata.normalize("NFKC", str(text)).strip()
+def draw_template_overlay(image: Image.Image, cfg: dict[str, Any]) -> Image.Image:
+    """Calibration preview: draw name/date columns and expected employee row bands."""
+    preview = image.copy().convert("RGBA")
+    width, height = preview.size
+    overlay = Image.new("RGBA", preview.size, (255, 255, 255, 0))
+    draw = ImageDraw.Draw(overlay, "RGBA")
 
+    x1 = width * float(cfg["day1_center_pct"]) / 100.0
+    x31 = width * float(cfg["day31_center_pct"]) / 100.0
+    if x31 <= x1:
+        return image.copy()
+    centers = np.linspace(x1, x31, 31)
+    step = float(centers[1] - centers[0])
+    name_left = int(width * float(cfg["name_left_pct"]) / 100.0)
+    name_right = int(width * float(cfg["name_right_pct"]) / 100.0)
+    row_step = height * float(cfg["row_step_pct"]) / 100.0
+    first_center = height * float(cfg["first_row_center_pct"]) / 100.0
+    band_half = row_step * float(cfg["row_crop_ratio"]) / 2.0
 
-def cluster_page_rows(items: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
-    """Y座標の近いOCR領域を暫定的な1行にまとめる。"""
-    if not items:
-        return []
-    ordered = sorted(items, key=lambda d: (d["center_y"], d["center_x"]))
-    typical_height = statistics.median(d["height"] for d in ordered)
-    tolerance = max(7.0, typical_height * 0.70)
-    clusters: list[list[dict[str, Any]]] = []
+    # Name field and per-day crop cells.
+    draw.rectangle([name_left, 0, name_right, height - 1], outline=(0, 120, 255, 230), width=max(2, width // 1200))
+    for i, center in enumerate(centers):
+        left = int(center - step / 2)
+        right = int(center + step / 2)
+        draw.line([int(center), 0, int(center), height], fill=(255, 80, 40, 190), width=max(1, width // 1800))
+        if i in (0, 30):
+            draw.text((int(center) + 2, max(2, int(height * 0.015))), str(i + 1), fill=(255, 40, 20, 255), stroke_width=1, stroke_fill=(255, 255, 255, 230))
+        # Subtle fill only for the first/last day to help tune endpoints.
+        if i in (0, 30):
+            draw.rectangle([left, 0, right, height - 1], fill=(255, 120, 0, 18))
 
-    for item in ordered:
-        best = None
-        best_distance = None
-        for cluster in clusters:
-            cy = statistics.median(x["center_y"] for x in cluster)
-            distance = abs(item["center_y"] - cy)
-            if distance <= tolerance and (best_distance is None or distance < best_distance):
-                best = cluster
-                best_distance = distance
-        if best is None:
-            clusters.append([item])
-        else:
-            best.append(item)
-    return sorted(clusters, key=lambda c: statistics.median(d["center_y"] for d in c))
-
-
-def header_day_mentions(item: dict[str, Any]) -> list[tuple[int, float]]:
-    """認識テキストから日付見出し候補を取得。
-
-    「1日」のような単独ラベルと、OCRが「1 2 3 ...」を1領域にまとめたケースを扱う。
-    英数字のコード（D1等）の末尾数字を日付と誤検出しないよう英数字境界を確認する。
-    """
-    text = normalized_text(item["text"])
-    if not text:
-        return []
-    matches = list(re.finditer(r"(?<![A-Za-z0-9])(\d{1,2})\s*日?(?![A-Za-z0-9])", text))
-    found: list[tuple[int, float]] = []
-    for match in matches:
-        day = int(match.group(1))
-        if not 1 <= day <= 31:
-            continue
-        char_position = (match.start(1) + match.end(1)) / 2
-        proportion = char_position / max(1, len(text))
-        x = item["x_min"] + proportion * item["width"]
-        found.append((day, x))
-    return found
-
-
-def infer_day_centers(
-    clusters: list[list[dict[str, Any]]],
-    image_width: int,
-    manual_day1_pct: float,
-    manual_day31_pct: float,
-    auto_detect: bool,
-) -> tuple[np.ndarray, int | None, str, int]:
-    """日付見出し位置から31列のX中心を推定。検出できなければ手動指定を使用。"""
-    header_index: int | None = None
-    centers = None
-    anchor_count = 0
-    candidates: list[tuple[int, dict[int, list[float]]]] = []
-
-    # 日付見出し行の特定は手動位置モードでも実行する。
-    # これにより手動調整に切り替えた場合でも「1日～31日」の見出しを職員行と誤認しない。
-    for index, cluster in enumerate(clusters):
-        per_day: dict[int, list[float]] = {}
-        for item in cluster:
-            for day, x in header_day_mentions(item):
-                per_day.setdefault(day, []).append(x)
-        if len(per_day) >= 5:
-            candidates.append((index, per_day))
-
-    if candidates:
-        candidates.sort(
-            key=lambda pair: (
-                int(min(pair[1]) <= 4 and max(pair[1]) >= 28),
-                len(pair[1]),
-            ),
-            reverse=True,
-        )
-        candidate_index, per_day = candidates[0]
-        header_index = candidate_index
-        days = np.asarray(sorted(per_day), dtype=float)
-        xs = np.asarray([statistics.median(per_day[int(d)]) for d in days], dtype=float)
-        anchor_count = len(days)
-        if auto_detect and len(days) >= 5 and float(days.max() - days.min()) >= 10:
-            slope, intercept = np.polyfit(days, xs, 1)
-            if slope > 0:
-                estimated = intercept + slope * np.arange(1, 32, dtype=float)
-                # 左右端から大きく外れる推定は採用しない。
-                if estimated[0] >= -0.05 * image_width and estimated[-1] <= 1.05 * image_width:
-                    centers = np.clip(estimated, 0, image_width - 1)
-
-    if centers is not None:
-        method = f"OCRで日付見出しを自動検出（{anchor_count}日分の見出し）"
-    else:
-        x1 = image_width * manual_day1_pct / 100.0
-        x31 = image_width * manual_day31_pct / 100.0
-        if x31 <= x1:
-            x31 = min(image_width - 1, x1 + image_width * 0.75)
-        centers = np.linspace(x1, x31, 31)
-        method = "手動指定の位置から31列を等間隔に推定"
-    return centers, header_index, method, anchor_count
-
-
-def parse_shift_tokens(text: str, allowed_tokens: list[str]) -> list[tuple[str, float, float]]:
-    """勤務記号を最長一致で分割し、OCR文字列中の相対位置も返す。
-
-    戻り値: [(勤務記号, start_ratio, end_ratio), ...]
-    未知語は一塊として残し、勝手に文字単位で分解しない。
-    """
-    raw = normalized_text(text)
-    if not raw:
-        return []
-    tokens = sorted({normalized_text(t) for t in allowed_tokens if normalized_text(t)}, key=len, reverse=True)
-    if not tokens:
-        return [(raw, 0.0, 1.0)]
-
-    spans: list[tuple[str, float, float]] = []
-    # OCR領域に空白がある場合、空白ごとの塊をそれぞれ最長一致で解析する。
-    pieces = list(re.finditer(r"\S+", raw))
-    for piece in pieces:
-        segment = piece.group(0)
-        pos = 0
-        segment_tokens: list[tuple[str, int, int]] = []
-        fully_parsed = True
-        while pos < len(segment):
-            match_token = next((token for token in tokens if segment.startswith(token, pos)), None)
-            if match_token is None:
-                fully_parsed = False
-                break
-            segment_tokens.append((match_token, pos, pos + len(match_token)))
-            pos += len(match_token)
-
-        if fully_parsed and segment_tokens:
-            for token, start, end in segment_tokens:
-                absolute_start = piece.start() + start
-                absolute_end = piece.start() + end
-                spans.append((token, absolute_start / len(raw), absolute_end / len(raw)))
-        else:
-            # 未知の記号・文字列は1つの値として扱い、誤った文字分割を避ける。
-            spans.append((segment, piece.start() / len(raw), piece.end() / len(raw)))
-
-    return spans
-
-
-def _is_header_or_metadata(text: str) -> bool:
-    value = normalized_text(text).lower().replace(" ", "")
-    if value in {x.lower() for x in HEADER_NAMES}:
-        return True
-    if value in {"対象年月", "年月", "施設名", "勤務表", "シフト表", "合計", "備考", "部署名"}:
-        return True
-    return False
-
-
-def _looks_like_shift_token(text: str, allowed_tokens: list[str]) -> bool:
-    normalized = normalized_text(text)
-    if not normalized:
-        return False
-    return normalized in {normalized_text(t) for t in allowed_tokens}
-
-
-def _get_name_candidate(left_items: list[dict[str, Any]], allowed_tokens: list[str]) -> str:
-    candidates = []
-    for item in sorted(left_items, key=lambda d: d["center_x"]):
-        txt = normalized_text(item["text"])
-        if not txt or _is_header_or_metadata(txt):
-            continue
-        if re.fullmatch(r"[0-9.\-]+", txt):
-            continue
-        if _looks_like_shift_token(txt, allowed_tokens):
-            continue
-        candidates.append(item)
-
-    if not candidates:
-        return ""
-    # 左側に番号列がある場合は、日付列に近い最後の非数値テキストを氏名候補にする。
-    # 氏名が複数の領域に分かれている場合は、隣接候補を連結する。
-    chosen = [candidates[-1]]
-    for item in reversed(candidates[:-1]):
-        last = chosen[0]
-        gap = last["x_min"] - item["x_max"]
-        if gap <= max(last["height"], item["height"]) * 0.5:
-            chosen.insert(0, item)
-        else:
+    for row_idx in range(int(cfg["row_count"])):
+        center_y = first_center + row_idx * row_step
+        top = int(max(0, center_y - band_half))
+        bottom = int(min(height - 1, center_y + band_half))
+        if top >= height or center_y >= height:
             break
-    return "".join(normalized_text(item["text"]) for item in chosen).strip()
+        color = (0, 160, 90, 135) if row_idx == 0 else (0, 160, 90, 70)
+        draw.rectangle([name_left, top, width - 1, bottom], outline=color, width=max(1, width // 1800))
+        draw.line([0, int(center_y), width - 1, int(center_y)], fill=(0, 160, 90, 110), width=max(1, width // 2200))
+        if row_idx < 5:
+            draw.text((2, top + 2), f"row {row_idx + 1}", fill=(0, 100, 30, 255), stroke_width=1, stroke_fill=(255, 255, 255, 220))
+
+    return Image.alpha_composite(preview, overlay).convert("RGB")
 
 
-def build_schedule(
-    detections: list[dict[str, Any]],
-    manual_day1_pct: float,
-    manual_day31_pct: float,
-    auto_detect: bool,
-    allowed_tokens: list[str],
-) -> tuple[pd.DataFrame, pd.DataFrame, dict[int, str], list[dict[str, Any]]]:
-    """OCR領域を職員行と1～31日列に変換する。位置推定が曖昧な箇所は確認表に残す。"""
-    schedule_rows: list[dict[str, Any]] = []
-    review_records: list[dict[str, Any]] = []
-    page_layouts: dict[int, str] = {}
-    line_summaries: list[dict[str, Any]] = []
-    pages = sorted({int(d["page"]) for d in detections})
-
-    for page_no in pages:
-        page_items = [d for d in detections if int(d["page"]) == page_no]
-        if not page_items:
-            continue
-        width = int(page_items[0]["image_width"])
-        height = int(page_items[0]["image_height"])
-        clusters = cluster_page_rows(page_items)
-        day_centers, header_index, method, anchor_count = infer_day_centers(
-            clusters, width, manual_day1_pct, manual_day31_pct, auto_detect
-        )
-        page_layouts[page_no] = method
-        steps = np.diff(day_centers)
-        cell_width = float(np.median(steps)) if len(steps) else width / 31
-        name_boundary = float(day_centers[0] - cell_width * 0.5)
-        page_row_number = 0
-
-        for cluster_index, cluster in enumerate(clusters):
-            cluster = sorted(cluster, key=lambda d: d["center_x"])
-            y_center = statistics.median(d["center_y"] for d in cluster)
-            y_pct = y_center / max(1, height) * 100
-            is_header_row = header_index is not None and cluster_index == header_index
-
-            if is_header_row:
-                for item in cluster:
-                    review_records.append(_review_record(item, 0, "日付見出し", "", "", ""))
-                continue
-
-            left_items = [d for d in cluster if d["center_x"] < name_boundary and d["x_max"] < day_centers[0] + cell_width * 0.05]
-            # 日付列のセルが、列中心から離れている場合の許容幅。
-            right_items = [d for d in cluster if d["center_x"] >= name_boundary]
-
-            # 一つのOCR領域が氏名列から日付列までまたいでいる場合の補助処理。
-            crossing_items = [d for d in cluster if d["x_min"] < name_boundary and d["x_max"] > day_centers[0]]
-            name = _get_name_candidate(left_items, allowed_tokens)
-            shift_items = right_items[:]
-            special_tokens: list[tuple[dict[str, Any], list[tuple[str, float, float]]]] = []
-
-            if not name and crossing_items:
-                # OCRが行全体を一つの領域にまとめた場合は、まず空白で氏名と勤務欄を分離する。
-                crossing = max(crossing_items, key=lambda d: d["width"])
-                full_text = normalized_text(crossing["text"])
-                if re.search(r"\s", crossing["text"]):
-                    parts = list(re.finditer(r"\S+", normalized_text(crossing["text"])))
-                    if len(parts) >= 2:
-                        name = parts[0].group(0)
-                        tail_start = parts[1].start()
-                        tail = full_text[tail_start:]
-                        parsed = parse_shift_tokens(tail, allowed_tokens)
-                        # tailに対する相対位置を元領域の相対位置へ戻す。
-                        adjusted = []
-                        for token, start, end in parsed:
-                            adjusted.append((token, (tail_start + start * len(tail)) / max(1, len(full_text)), (tail_start + end * len(tail)) / max(1, len(full_text)))
-                            )
-                        special_tokens.append((crossing, adjusted))
-                        shift_items = [d for d in right_items if d is not crossing]
-                else:
-                    # 空白がなく、既知の勤務記号で末尾を分割できる場合のみ暫定分離する。
-                    remainder = full_text
-                    rev_tokens: list[tuple[str, int, int]] = []
-                    sorted_tokens = sorted({normalized_text(t) for t in allowed_tokens if normalized_text(t)}, key=len, reverse=True)
-                    while remainder:
-                        match_token = next((t for t in sorted_tokens if remainder.endswith(t)), None)
-                        if match_token is None:
-                            break
-                        rev_tokens.insert(0, (match_token, len(remainder) - len(match_token), len(remainder)))
-                        remainder = remainder[:-len(match_token)]
-                        if len(rev_tokens) >= 31:
-                            break
-                    if remainder and len(rev_tokens) >= 2:
-                        name = remainder
-                        special_tokens.append((crossing, [(t, s / len(full_text), e / len(full_text)) for t, s, e in rev_tokens]))
-                        shift_items = [d for d in right_items if d is not crossing]
-
-            page_row_number += 1
-            is_metadata_row = all(_is_header_or_metadata(d["text"]) for d in cluster)
-            if is_metadata_row:
-                for item in cluster:
-                    review_records.append(_review_record(item, page_row_number, "見出し/メタ情報", "", "", ""))
-                continue
-
-            cell_values: dict[int, tuple[str, float, bool]] = {}
-            item_to_days: dict[int, list[int]] = {}
-            item_to_class: dict[int, str] = {}
-
-            def assign_detection(item: dict[str, Any], text_for_parse: str | None = None,
-                                 position_start: float | None = None,
-                                 position_end: float | None = None) -> None:
-                txt = normalized_text(text_for_parse if text_for_parse is not None else item["text"])
-                if not txt or _is_header_or_metadata(txt):
-                    item_to_class[id(item)] = "見出し/メタ情報"
-                    return
-                parse_text = txt
-                spans = parse_shift_tokens(parse_text, allowed_tokens)
-                # 名前が一つのOCR領域に混在するケース以外では、unknown textも一つのセルへ保持。
-                local_start = item["x_min"] if position_start is None else position_start
-                local_end = item["x_max"] if position_end is None else position_end
-                span_width = max(1.0, local_end - local_start)
-                assigned_days: list[int] = []
-                unresolved = False
-                for token, start_ratio, end_ratio in spans:
-                    token_x = local_start + ((start_ratio + end_ratio) / 2) * span_width
-                    day_index = int(np.argmin(np.abs(day_centers - token_x))) + 1
-                    distance = abs(float(day_centers[day_index - 1]) - token_x)
-                    if distance > cell_width * 0.72:
-                        unresolved = True
-                        continue
-                    current = cell_values.get(day_index)
-                    value = token
-                    needs_review = float(item["score"]) < LOW_CONFIDENCE or unresolved
-                    if current is None or float(item["score"]) > current[1]:
-                        cell_values[day_index] = (value, float(item["score"]), needs_review)
-                    elif current[0] != value:
-                        cell_values[day_index] = (current[0] + " / " + value, current[1], True)
-                        needs_review = True
-                    assigned_days.append(day_index)
-                item_to_days[id(item)] = sorted(set(assigned_days))
-                item_to_class[id(item)] = "勤務記号" if assigned_days else "未割当/要確認"
-
-            for item in shift_items:
-                if item in crossing_items and not name:
-                    # 行全体を分けられなかった領域を日付列に無理に割り当てない。
-                    item_to_class[id(item)] = "氏名・勤務欄の分離失敗"
-                    item_to_days[id(item)] = []
-                    continue
-                assign_detection(item)
-
-            for item, spans in special_tokens:
-                # crossing領域の相対位置を用いて、末尾の勤務記号を日付位置に割り当てる。
-                txt = normalized_text(item["text"])
-                local = []
-                for token, start_ratio, end_ratio in spans:
-                    token_x = item["x_min"] + (start_ratio + end_ratio) / 2 * item["width"]
-                    day_index = int(np.argmin(np.abs(day_centers - token_x))) + 1
-                    if abs(float(day_centers[day_index - 1]) - token_x) <= cell_width * 0.85:
-                        current = cell_values.get(day_index)
-                        # 行全体を分割した場合は文字位置を比例推定しているため、必ず要確認にする。
-                        needs_review = True
-                        if current is None or float(item["score"]) > current[1]:
-                            cell_values[day_index] = (token, float(item["score"]), needs_review)
-                        elif current[0] != token:
-                            cell_values[day_index] = (current[0] + " / " + token, current[1], True)
-                        local.append(day_index)
-                item_to_days[id(item)] = sorted(set(local))
-                item_to_class[id(item)] = "行全体から分割（要確認）"
-
-            nonempty_cells = len(cell_values)
-            if name and nonempty_cells == 0:
-                # 名前だけの行/見出しを勤務データとして出力しない。
-                for item in cluster:
-                    review_records.append(_review_record(item, page_row_number, "氏名候補/勤務欄なし", name, "", ""))
-                continue
-            if not name and nonempty_cells == 0:
-                for item in cluster:
-                    review_records.append(_review_record(item, page_row_number, item_to_class.get(id(item), "未割当"), "", "", ""))
-                continue
-            if not name:
-                name = f"要確認（p{page_no}-r{page_row_number}）"
-
-            # 同じページに同名が複数行あれば、区別できるようページ内行番号を付ける。
-            name_values = [r["氏名"] for r in schedule_rows if r.get("ページ") == page_no]
-            if name in name_values:
-                name = f"{name}（行{page_row_number}）"
-
-            output_row: dict[str, Any] = {"氏名": name, "ページ": page_no, "OCR行": page_row_number}
-            for day in range(1, 32):
-                output_row[f"{day}日"] = cell_values.get(day, ("", 0.0, False))[0]
-            output_row["要確認セル数"] = sum(1 for _day, (_value, _score, needs) in cell_values.items() if needs)
-            schedule_rows.append(output_row)
-
-            for item in cluster:
-                cls = item_to_class.get(id(item), "氏名候補" if item in left_items else "未割当")
-                days_for_item = item_to_days.get(id(item), [])
-                mapped_days = ",".join(str(d) for d in days_for_item)
-                review_records.append(_review_record(item, page_row_number, cls, name, mapped_days, ""))
-
-            line_summaries.append({
-                "ページ": page_no,
-                "OCR行": page_row_number,
-                "推定氏名": name,
-                "検出セル数": nonempty_cells,
-                "要確認セル数": output_row["要確認セル数"],
-                "Y位置(%)": round(y_pct, 2),
-            })
-
-    # Excel本体はご指定の形式（氏名＋1日～31日）のみにする。
-    if schedule_rows:
-        schedule_df = pd.DataFrame(schedule_rows)
-        # ページと解析補助情報は本表から除外。重複氏名などの確認はOCR確認シート側に残す。
-        schedule_df = schedule_df[SCHEDULE_COLUMNS].copy()
-    else:
-        schedule_df = pd.DataFrame(columns=SCHEDULE_COLUMNS)
-
-    review_df = pd.DataFrame(review_records, columns=REVIEW_COLUMNS)
-    return schedule_df, review_df, page_layouts, line_summaries
+def _cell_is_blank(gray_array: np.ndarray) -> bool:
+    """Avoid running the recognizer on genuinely empty cells."""
+    if gray_array.size == 0:
+        return True
+    # Treat only very sparse dark pixels as blank; faint writing should remain eligible.
+    dark_ratio = float(np.mean(gray_array < 205))
+    return dark_ratio < 0.0012
 
 
-def _review_record(
-    item: dict[str, Any], row_no: int, classification: str,
-    employee_name: str, day_text: str, _unused: str,
-) -> dict[str, Any]:
-    width = max(1, int(item.get("image_width", 1)))
-    height = max(1, int(item.get("image_height", 1)))
-    score = float(item.get("score", 0.0))
-    needs_review = score < LOW_CONFIDENCE or classification in {"未割当", "未割当/要確認", "氏名・勤務欄の分離失敗", "行全体から分割（要確認）"}
-    return {
-        "ページ": item.get("page", ""),
-        "OCR行": row_no,
-        "分類": classification,
-        "推定氏名": employee_name,
-        "推定日": day_text,
-        "認識テキスト": item.get("text", ""),
-        "信頼度": round(score, 4),
-        "要確認": "要確認" if needs_review else "",
-        "X中心(%)": round(float(item.get("center_x", 0)) / width * 100, 2),
-        "Y中心(%)": round(float(item.get("center_y", 0)) / height * 100, 2),
-        "左端(px)": round(float(item.get("x_min", 0)), 1),
-        "右端(px)": round(float(item.get("x_max", 0)), 1),
+def prepare_crop(crop: Image.Image, upscale: int, enhance_contrast: bool, binarize: bool) -> tuple[np.ndarray | None, bool]:
+    """Trim blank margins around handwriting, upscale, and add a white border.
+
+    Returns (RGB ndarray or None if blank, is_blank).
+    """
+    gray = crop.convert("L")
+    if enhance_contrast:
+        gray = ImageOps.autocontrast(gray, cutoff=1)
+    arr = np.asarray(gray)
+    if _cell_is_blank(arr):
+        return None, True
+
+    # Tight crop around dark strokes so a one-letter symbol is not shrunk by large cell margins.
+    ink = arr < 225
+    ys, xs = np.where(ink)
+    if len(xs) < 3:
+        return None, True
+
+    x_min, x_max = int(xs.min()), int(xs.max()) + 1
+    y_min, y_max = int(ys.min()), int(ys.max()) + 1
+    char_w = max(1, x_max - x_min)
+    char_h = max(1, y_max - y_min)
+    pad_x = max(3, int(char_w * 0.18))
+    pad_y = max(3, int(char_h * 0.18))
+    x_min = max(0, x_min - pad_x)
+    x_max = min(arr.shape[1], x_max + pad_x)
+    y_min = max(0, y_min - pad_y)
+    y_max = min(arr.shape[0], y_max + pad_y)
+    gray = gray.crop((x_min, y_min, x_max, y_max))
+
+    if binarize:
+        a = np.asarray(gray)
+        # Otsu-like fixed threshold after autocontrast; preserve black text on white.
+        gray = Image.fromarray(np.where(a < 190, 0, 255).astype(np.uint8), mode="L")
+
+    scale = int(upscale)
+    gray = gray.resize((max(24, gray.width * scale), max(24, gray.height * scale)), Image.Resampling.LANCZOS)
+    pad = max(8, 8 * scale)
+    canvas = Image.new("L", (gray.width + pad * 2, gray.height + pad * 2), color=255)
+    canvas.paste(gray, (pad, pad))
+    rgb = canvas.convert("RGB")
+    return np.asarray(rgb), False
+
+
+def _find_text_score(obj: Any) -> tuple[str, float] | None:
+    """Find a PaddleOCR recognition pair in its version-specific nested return value."""
+    if isinstance(obj, (list, tuple)) and len(obj) >= 2:
+        if isinstance(obj[0], str) and isinstance(obj[1], (numbers.Real, np.number)):
+            try:
+                return obj[0], float(obj[1])
+            except (TypeError, ValueError):
+                pass
+    if isinstance(obj, (list, tuple)):
+        for child in obj:
+            found = _find_text_score(child)
+            if found is not None:
+                return found
+    return None
+
+
+def recognize_prepared_crops(ocr: PaddleOCR, crop_arrays: list[np.ndarray], batch_size: int = 64) -> list[tuple[str, float]]:
+    """Use recognition-only mode on a batch of already-cropped cells.
+
+    Recognition-only is important here: the cell's known location replaces full-page
+    text detection, which often misses one-character shift codes.
+    """
+    if not crop_arrays:
+        return []
+    outputs: list[tuple[str, float]] = []
+
+    # PaddleOCR 2.10 exposes the recognizer. Batch calls are much faster than launching
+    # the full detector separately for every one of the 31 cells in each employee row.
+    recognizer = getattr(ocr, "text_recognizer", None)
+    if callable(recognizer):
+        try:
+            for start in range(0, len(crop_arrays), batch_size):
+                batch = crop_arrays[start:start + batch_size]
+                raw = recognizer(batch)
+                if not isinstance(raw, (list, tuple)) or len(raw) != len(batch):
+                    raise RuntimeError("PaddleOCR text recognizer returned an unexpected result shape.")
+                for item in raw:
+                    pair = _find_text_score(item)
+                    outputs.append(pair if pair is not None else ("", 0.0))
+            return outputs
+        except Exception:
+            # Fall through to the public OCR method for compatibility with builds
+            # whose recognizer wrapper differs from the pinned 2.10 environment.
+            outputs = []
+
+    for crop_array in crop_arrays:
+        try:
+            raw = ocr.ocr(crop_array, det=False, rec=True, cls=False)
+            pair = _find_text_score(raw)
+            outputs.append(pair if pair is not None else ("", 0.0))
+        except Exception:
+            outputs.append(("", 0.0))
+    return outputs
+
+
+def normalize_ocr_text(text: str) -> str:
+    value = unicodedata.normalize("NFKC", str(text or ""))
+    return re.sub(r"\s+", "", value).strip()
+
+
+def is_metadata_name(name: str) -> bool:
+    normalized = normalize_ocr_text(name).lower()
+    return normalized in {normalize_ocr_text(x).lower() for x in HEADER_NAMES} or normalized in {
+        "部署", "所属", "氏名", "職員名", "従業員名", "勤務表", "シフト表", "備考", "合計", "対象年月", "施設名", "番号"
     }
 
 
-def make_excel(schedule_df: pd.DataFrame, review_df: pd.DataFrame, metadata: dict[str, Any]) -> bytes:
-    """メインシートを氏名×1日～31日に整形し、OCR確認情報を別シートへ保存。"""
-    output = io.BytesIO()
-    meta_df = pd.DataFrame([{"項目": k, "値": v} for k, v in metadata.items()], columns=META_COLUMNS)
+def cell_box_for_day(width: int, day_index: int, x1_pct: float, x31_pct: float, inset_ratio: float = 0.12) -> tuple[int, int]:
+    centers = np.linspace(width * x1_pct / 100, width * x31_pct / 100, 31)
+    step = float(centers[1] - centers[0])
+    center = float(centers[day_index - 1])
+    inset = step * float(inset_ratio)
+    left = int(max(0, center - step / 2 + inset))
+    right = int(min(width, center + step / 2 - inset))
+    if right <= left:
+        right = min(width, left + 1)
+    return left, right
 
+
+def crop_schedule_cells(image: Image.Image, cfg: dict[str, Any], page_no: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Cut every employee-name and daily cell using the calibrated fixed template."""
+    width, height = image.size
+    x1 = float(cfg["day1_center_pct"])
+    x31 = float(cfg["day31_center_pct"])
+    if x31 <= x1:
+        raise ValueError("1日列の中心は31日列の中心より左に指定してください。")
+    if float(cfg["name_right_pct"]) <= float(cfg["name_left_pct"]):
+        raise ValueError("氏名欄の右端は左端より右に指定してください。")
+
+    row_step_px = height * float(cfg["row_step_pct"]) / 100
+    if row_step_px <= 1:
+        raise ValueError("職員行の間隔が小さすぎます。テンプレート設定を確認してください。")
+    band_h = max(4, row_step_px * float(cfg["row_crop_ratio"]))
+    first_y = height * float(cfg["first_row_center_pct"]) / 100
+    crop_items: list[dict[str, Any]] = []
+    cells: list[dict[str, Any]] = []
+
+    for row_idx in range(int(cfg["row_count"])):
+        center_y = first_y + row_idx * row_step_px
+        y_top = int(max(0, center_y - band_h / 2))
+        y_bottom = int(min(height, center_y + band_h / 2))
+        if center_y >= height or y_bottom <= y_top + 1:
+            break
+
+        # Name column crop. The user adjusts the left/right bounds once for the template.
+        name_left = int(width * float(cfg["name_left_pct"]) / 100)
+        name_right = int(width * float(cfg["name_right_pct"]) / 100)
+        name_crop = image.crop((max(0, name_left), y_top, min(width, name_right), y_bottom))
+        name_arr, name_blank = prepare_crop(name_crop, cfg["upscale"], cfg["enhance_contrast"], cfg["binarize"])
+        cells.append({
+            "page": page_no, "row": row_idx + 1, "kind": "name", "day": None,
+            "box": (name_left, y_top, name_right, y_bottom), "blank": name_blank,
+            "array": name_arr,
+        })
+
+        for day in range(1, 32):
+            day_left, day_right = cell_box_for_day(width, day, x1, x31)
+            day_crop = image.crop((day_left, y_top, day_right, y_bottom))
+            arr, blank = prepare_crop(day_crop, cfg["upscale"], cfg["enhance_contrast"], cfg["binarize"])
+            cells.append({
+                "page": page_no, "row": row_idx + 1, "kind": "shift", "day": day,
+                "box": (day_left, y_top, day_right, y_bottom), "blank": blank,
+                "array": arr,
+            })
+
+    nonblank = [item for item in cells if not item["blank"] and item["array"] is not None]
+    return cells, nonblank
+
+
+def run_template_ocr(images: list[Image.Image], cfg: dict[str, Any], allowed_tokens: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Read each known cell, build the schedule table, and create a cell-level review log."""
+    ocr = get_ocr_engine()
+    all_cells: list[dict[str, Any]] = []
+    work_items: list[dict[str, Any]] = []
+    progress_total = len(images) * int(cfg["row_count"])
+
+    progress = st.progress(0, text="テンプレートに沿ってセルを切り出しています...")
+    for page_no, image in enumerate(images, start=1):
+        cells, nonblank = crop_schedule_cells(image, cfg, page_no)
+        all_cells.extend(cells)
+        work_items.extend(nonblank)
+        progress.progress(min(1.0, page_no / max(1, len(images))), text=f"{page_no}/{len(images)}ページのセル位置を計算しました")
+
+    crop_arrays = [item["array"] for item in work_items]
+    st.write(f"認識対象のセル数（空欄を除く）: **{len(crop_arrays)}**")
+    if crop_arrays:
+        with st.spinner("切り出したセルを認識しています。セルの数に応じて時間がかかります..."):
+            recognized = recognize_prepared_crops(ocr, crop_arrays, batch_size=64)
+        for item, (text, score) in zip(work_items, recognized):
+            item["text"] = normalize_ocr_text(text)
+            item["score"] = float(score)
+            item["blank"] = not bool(item["text"])
+    progress.empty()
+
+    # Attach blank-cell defaults and prepare the staff-by-day table.
+    for item in all_cells:
+        item.setdefault("text", "")
+        item.setdefault("score", 0.0)
+
+    by_page_row: dict[tuple[int, int], list[dict[str, Any]]] = {}
+    for item in all_cells:
+        by_page_row.setdefault((int(item["page"]), int(item["row"])), []).append(item)
+
+    schedule_records: list[dict[str, Any]] = []
+    review_records: list[dict[str, Any]] = []
+    allowed = {normalize_ocr_text(x) for x in allowed_tokens if normalize_ocr_text(x)}
+
+    for (page_no, row_no), row_cells in sorted(by_page_row.items()):
+        name_cell = next(item for item in row_cells if item["kind"] == "name")
+        name = normalize_ocr_text(name_cell.get("text", ""))
+        shift_cells = [item for item in row_cells if item["kind"] == "shift"]
+        shift_text_count = sum(bool(item.get("text")) for item in shift_cells)
+
+        # Ignore rows that are fully blank. Keep rows with shift marks but no name for manual repair.
+        if not name and shift_text_count == 0:
+            continue
+        if is_metadata_name(name):
+            continue
+        if not name:
+            name = f"要確認（P{page_no}-行{row_no}）"
+            name_cell["needs_review"] = True
+        else:
+            name_cell["needs_review"] = float(name_cell.get("score", 0.0)) < LOW_CONFIDENCE
+
+        out: dict[str, Any] = {"氏名": name}
+        for item in shift_cells:
+            day = int(item["day"])
+            value = normalize_ocr_text(item.get("text", ""))
+            score = float(item.get("score", 0.0))
+            item["needs_review"] = bool(value) and (score < LOW_CONFIDENCE or value not in allowed)
+            out[f"{day}日"] = value
+
+        schedule_records.append(out)
+
+        # The review sheet lists recognized cells plus low-confidence/unknown values;
+        # it does not fill the log with hundreds of ordinary empty cells.
+        for item in [name_cell] + shift_cells:
+            value = normalize_ocr_text(item.get("text", ""))
+            if item["kind"] == "name":
+                needs_review = bool(item.get("needs_review", False))
+                field = "氏名"
+                day_label = ""
+                cell_position = f"X:{item['box'][0]}-{item['box'][2]} / Y:{item['box'][1]}-{item['box'][3]}"
+                score_value: float | str = round(float(item.get("score", 0.0)), 4) if value else ""
+                status = "要確認" if needs_review else ("認識" if value else "空欄")
+            else:
+                if not value:
+                    continue
+                needs_review = bool(item.get("needs_review", False))
+                field = "勤務記号"
+                day_label = f"{item['day']}日"
+                cell_position = f"X:{item['box'][0]}-{item['box'][2]} / Y:{item['box'][1]}-{item['box'][3]}"
+                score_value = round(float(item.get("score", 0.0)), 4)
+                status = "要確認" if needs_review else "認識"
+            review_records.append({
+                "ページ": item["page"], "行番号": item["row"], "項目": field,
+                "日付": day_label, "OCR結果": value, "信頼度": score_value,
+                "判定": status, "セル位置": cell_position,
+            })
+
+    schedule_df = pd.DataFrame(schedule_records, columns=SCHEDULE_COLUMNS)
+    review_df = pd.DataFrame(review_records, columns=REVIEW_COLUMNS)
+    if not schedule_df.empty:
+        # Keep input order: pages then row positions. Same names are allowed when repeated across pages.
+        schedule_df = schedule_df[SCHEDULE_COLUMNS]
+    return schedule_df, review_df
+
+
+def make_excel(schedule_df: pd.DataFrame, review_df: pd.DataFrame, metadata: dict[str, Any]) -> bytes:
+    output = io.BytesIO()
+    meta_df = pd.DataFrame([{"項目": key, "値": value} for key, value in metadata.items()], columns=META_COLUMNS)
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         schedule_df[SCHEDULE_COLUMNS].to_excel(writer, sheet_name="勤務シフト表", index=False)
         review_df.to_excel(writer, sheet_name="OCR確認", index=False)
@@ -542,197 +426,272 @@ def make_excel(schedule_df: pd.DataFrame, review_df: pd.DataFrame, metadata: dic
             "bold": True, "font_color": "white", "bg_color": "#1F4E78",
             "align": "center", "valign": "vcenter", "border": 1,
         })
-        name_fmt = workbook.add_format({"border": 1, "valign": "vcenter"})
-        cell_fmt = workbook.add_format({"border": 1, "align": "center", "valign": "vcenter"})
+        body_name_fmt = workbook.add_format({"border": 1, "valign": "vcenter"})
+        body_cell_fmt = workbook.add_format({"border": 1, "align": "center", "valign": "vcenter"})
 
         ws = writer.sheets["勤務シフト表"]
         ws.freeze_panes(1, 1)
         ws.autofilter(0, 0, max(0, len(schedule_df)), len(SCHEDULE_COLUMNS) - 1)
         ws.set_row(0, 24)
-        ws.set_column(0, 0, 22, name_fmt)
-        ws.set_column(1, 31, 6, cell_fmt)
-        for col_index, column_name in enumerate(SCHEDULE_COLUMNS):
-            ws.write(0, col_index, column_name, header_fmt)
+        ws.set_column(0, 0, 22, body_name_fmt)
+        ws.set_column(1, 31, 6, body_cell_fmt)
+        for col_idx, col_name in enumerate(SCHEDULE_COLUMNS):
+            ws.write(0, col_idx, col_name, header_fmt)
 
         review_ws = writer.sheets["OCR確認"]
         review_ws.freeze_panes(1, 0)
         if len(REVIEW_COLUMNS):
             review_ws.autofilter(0, 0, max(0, len(review_df)), len(REVIEW_COLUMNS) - 1)
-        review_ws.set_column(0, 4, 14)
-        review_ws.set_column(5, 5, 34)
-        review_ws.set_column(6, 11, 14)
-        for col_index, column_name in enumerate(REVIEW_COLUMNS):
-            review_ws.write(0, col_index, column_name, header_fmt)
+        review_ws.set_column(0, 3, 13)
+        review_ws.set_column(4, 4, 28)
+        review_ws.set_column(5, 6, 12)
+        review_ws.set_column(7, 7, 32)
+        for col_idx, col_name in enumerate(REVIEW_COLUMNS):
+            review_ws.write(0, col_idx, col_name, header_fmt)
 
         meta_ws = writer.sheets["処理情報"]
         meta_ws.set_column(0, 0, 24)
-        meta_ws.set_column(1, 1, 72)
-        for col_index, column_name in enumerate(META_COLUMNS):
-            meta_ws.write(0, col_index, column_name, header_fmt)
+        meta_ws.set_column(1, 1, 74)
+        for col_idx, col_name in enumerate(META_COLUMNS):
+            meta_ws.write(0, col_idx, col_name, header_fmt)
 
     return output.getvalue()
 
 
+def config_json_bytes(cfg: dict[str, Any]) -> bytes:
+    return json.dumps(cfg, ensure_ascii=False, indent=2).encode("utf-8")
+
+
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
-    st.title("📄 手書き勤務シフト表 OCR")
+    st.title("📄 手書き勤務シフト表 OCR（固定レイアウト版）")
     st.write(
-        "PDF・画像から文字を読み取り、Excelの1枚目を「氏名 × 1日～31日」の表に整形します。"
-        "OCRが間違えたセルは画面上で修正してからダウンロードできます。"
+        "毎月ほぼ同じ位置に職員名欄と1日～31日の列があるシフト表向けです。"
+        "テンプレートの座標から各セルを切り出し、文字検出ではなく文字認識中心で読み取ります。"
     )
     st.warning(
-        "OCRは勤務表の罫線や文字の書き方に影響されます。列位置が推定できない場合は手動設定を調整してください。"
-        "給与・勤怠に使用する前に必ず原本と照合してください。"
+        "固定レイアウトを利用しても、手書きの似た文字・空欄・薄い筆記は誤認識することがあります。"
+        "勤務データとして使用する前に原本と照合してください。"
     )
     st.info(
         "Streamlit Community Cloudではアップロードした書類がクラウド上で処理されます。"
-        "実際の職員名・勤務情報を使う前に、会社の情報管理ルールを確認してください。"
+        "実際の職員名や勤務データを使う際は、会社の情報管理ルールを確認してください。"
     )
 
     col1, col2 = st.columns(2)
     with col1:
-        target_ym = st.text_input("対象年月（処理情報シート用）", value=dt.datetime.now().strftime("%Y/%m"))
+        target_ym = st.text_input("対象年月（処理情報シート）", value=dt.datetime.now().strftime("%Y/%m"))
     with col2:
-        facility_name = st.text_input("施設名（処理情報シート用・任意）", value="")
+        facility_name = st.text_input("施設名（処理情報シート・任意）", value="")
 
     uploaded = st.file_uploader(
-        "勤務シフト表をアップロード（PDF / PNG / JPG / TIFF）",
+        "勤務シフト表（PDF / PNG / JPG / TIFF）",
         type=["pdf", "png", "jpg", "jpeg", "tif", "tiff"],
-        help=f"PDFは先頭から最大{MAX_PDF_PAGES}ページまで処理します。",
     )
-    dpi = st.slider("PDF画像化の解像度（DPI）", 150, 350, 250, 50)
+    config_upload = st.file_uploader(
+        "以前保存したテンプレート設定JSON（任意）",
+        type=["json"],
+        help="同じ形式のシフト表で座標設定を再利用できます。初回は未指定で構いません。",
+        key="template_config_upload",
+    )
 
-    st.subheader("列位置の設定")
-    auto_detect = st.checkbox("OCRで日付見出し（1日～31日）を自動検出する", value=True)
-    c1, c2 = st.columns(2)
-    with c1:
-        manual_day1_pct = st.slider("手動設定：1日列の中心（画像の左から%）", 1, 90, 18)
-    with c2:
-        manual_day31_pct = st.slider("手動設定：31日列の中心（画像の左から%）", 10, 100, 98)
-    st.caption("日付見出しを自動検出できなかった場合に、上記の1日列・31日列を使って列位置を等間隔に推定します。")
+    # Apply uploaded JSON once, before the related sliders are instantiated.
+    if config_upload is not None:
+        config_raw = config_upload.getvalue()
+        config_hash = hashlib.sha256(config_raw).hexdigest()
+        if st.session_state.get("_loaded_config_hash") != config_hash:
+            try:
+                loaded = json.loads(config_raw.decode("utf-8-sig"))
+                for key, default in CONFIG_DEFAULTS.items():
+                    if key in loaded:
+                        value = loaded[key]
+                        if isinstance(default, bool):
+                            value = bool(value)
+                        elif isinstance(default, int) and not isinstance(default, bool):
+                            value = int(value)
+                        elif isinstance(default, float):
+                            value = float(value)
+                        st.session_state[f"cfg_{key}"] = value
+                st.session_state["_loaded_config_hash"] = config_hash
+                st.success("テンプレート設定を読み込みました。プレビューの位置を確認してください。")
+            except Exception as exc:
+                st.error(f"テンプレート設定JSONを読み込めませんでした: {exc}")
+
+    # Seed widget state with defaults. Values from an uploaded JSON take precedence.
+    for key, default in CONFIG_DEFAULTS.items():
+        st.session_state.setdefault(f"cfg_{key}", default)
+
+    st.subheader("1. 固定レイアウトの設定")
+    st.caption(
+        "数値は画像全体に対するパーセントです。1日・31日は各列の中心、最初の職員行は氏名欄の最初の人の中心に合わせます。"
+    )
+    with st.expander("テンプレート設定（初回に調整し、JSONとして保存できます）", expanded=True):
+        st.markdown("**列の位置**")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.slider("1日列の中心X位置（左から%）", 1.0, 98.0, step=0.1, key="cfg_day1_center_pct")
+            st.slider("氏名欄の左端X位置（%）", 0.0, 30.0, step=0.1, key="cfg_name_left_pct")
+        with c2:
+            st.slider("31日列の中心X位置（左から%）", 2.0, 100.0, step=0.1, key="cfg_day31_center_pct")
+            st.slider("氏名欄の右端X位置（%）", 1.0, 50.0, step=0.1, key="cfg_name_right_pct")
+
+        st.markdown("**職員行の位置と間隔**")
+        c3, c4 = st.columns(2)
+        with c3:
+            st.slider("最初の職員行の中心Y位置（上から%）", 1.0, 99.0, step=0.1, key="cfg_first_row_center_pct")
+            st.slider("職員行の間隔（画像高さに対する%）", 0.4, 8.0, step=0.1, key="cfg_row_step_pct")
+        with c4:
+            st.slider("読み取る職員行数", 1, 60, step=1, key="cfg_row_count")
+            st.slider("行セルの縦方向の切り出し幅（行間隔の比率）", 0.40, 0.95, step=0.01, key="cfg_row_crop_ratio")
+
+        st.markdown("**文字画像の前処理**")
+        c5, c6, c7 = st.columns(3)
+        with c5:
+            st.slider("文字画像の拡大倍率", 1, 5, step=1, key="cfg_upscale")
+        with c6:
+            st.checkbox("コントラストを補正", key="cfg_enhance_contrast")
+        with c7:
+            st.checkbox("白黒2値化", key="cfg_binarize", help="薄い文字が消える場合はオフのままにしてください。")
+        st.slider("PDFの画像化解像度（DPI）", 150, 400, step=25, key="cfg_dpi")
+
+    cfg = get_config()
+    if float(cfg["day31_center_pct"]) <= float(cfg["day1_center_pct"]):
+        st.error("1日列の中心が31日列の中心より右です。列位置を修正してください。")
+    if float(cfg["name_right_pct"]) <= float(cfg["name_left_pct"]):
+        st.error("氏名欄の右端が左端より左です。氏名欄の位置を修正してください。")
+
+    st.download_button(
+        "⚙️ 現在のテンプレート設定をJSONで保存",
+        data=config_json_bytes(cfg),
+        file_name="shift_template_config.json",
+        mime="application/json",
+    )
 
     token_text = st.text_input(
-        "勤務記号（長い記号を先に認識します。カンマ区切りで追加・変更できます）",
+        "勤務記号（カンマ区切り。既存の候補を残し、必要に応じて追加してください）",
         value=DEFAULT_SHIFT_TOKENS,
     )
     allowed_tokens = [token.strip() for token in token_text.split(",") if token.strip()]
 
-    file_bytes = uploaded.getvalue() if uploaded is not None else b""
-    signature = hashlib.sha256(file_bytes).hexdigest() if file_bytes else ""
-    dpi_signature = f"{signature}|{dpi}"
-    if "ocr_result_payload" not in st.session_state:
-        st.session_state["ocr_result_payload"] = None
-    old_payload = st.session_state.get("ocr_result_payload")
-    if old_payload and old_payload.get("signature") != dpi_signature:
-        st.session_state["ocr_result_payload"] = None
+    if uploaded is None:
+        st.caption("ファイルをアップロードすると、テンプレートの位置合わせ用プレビューを表示します。")
+        return
 
-    run_ocr = st.button("OCRを実行してシフト表を作成", type="primary", disabled=uploaded is None)
-    if run_ocr and uploaded is not None:
+    file_bytes = uploaded.getvalue()
+    file_hash = hashlib.sha256(file_bytes).hexdigest()
+    preview_signature = f"{file_hash}|{cfg['dpi']}"
+    if st.session_state.get("preview_signature") != preview_signature:
         try:
-            with st.spinner("PDF/画像を読み込んでいます..."):
-                images, total_pages, processed_pages = load_images(file_bytes, uploaded.name, dpi)
-            ocr = get_ocr_engine()
-            detections: list[dict[str, Any]] = []
-            progress = st.progress(0, text="OCRを準備しています...")
-            with st.spinner("PaddleOCRで文字認識中です。初回はモデルのダウンロードに時間がかかります..."):
-                for page_no, image in enumerate(images, start=1):
-                    result = ocr.ocr(np.asarray(image.convert("RGB")), cls=True)
-                    detections.extend(extract_detections(result, page_no, image.width, image.height))
-                    progress.progress(page_no / max(1, len(images)), text=f"{page_no}/{len(images)}ページ処理済み")
-            progress.empty()
-            st.session_state["ocr_result_payload"] = {
-                "signature": dpi_signature,
-                "detections": detections,
-                "preview_image": images[0].copy() if images else None,
+            with st.spinner("プレビュー画像を準備しています..."):
+                images, total_pages, processed_pages = load_images(file_bytes, uploaded.name, int(cfg["dpi"]))
+            st.session_state["preview_signature"] = preview_signature
+            st.session_state["preview_images"] = images
+            st.session_state["total_pages"] = total_pages
+            st.session_state["processed_pages"] = processed_pages
+            st.session_state["ocr_output"] = None
+        except Exception as exc:
+            st.error(f"PDF/画像の読み込みに失敗しました: {exc}")
+            return
+
+    images = st.session_state.get("preview_images", [])
+    if not images:
+        st.error("プレビュー画像がありません。ファイルを選び直してください。")
+        return
+
+    st.subheader("2. テンプレートの位置を確認")
+    st.caption(
+        "青枠が氏名欄、赤線が日付列の中心、緑枠が各職員行の切り出し範囲です。"
+        "色の線が原本の列中心・職員行の中央に重なるように調整してください。"
+    )
+    preview = draw_template_overlay(images[0], cfg)
+    st.image(preview, caption="テンプレートオーバーレイ（先頭ページ）", use_container_width=True)
+
+    row_end_pct = float(cfg["first_row_center_pct"]) + (int(cfg["row_count"]) - 1) * float(cfg["row_step_pct"])
+    if row_end_pct + float(cfg["row_step_pct"]) * float(cfg["row_crop_ratio"]) / 2 > 100:
+        st.warning("設定された職員行数では、最終行の切り出し範囲がページ下端を越えます。行数・間隔を確認してください。")
+    if st.session_state.get("total_pages", 1) > MAX_PDF_PAGES:
+        st.warning(f"PDFは全{st.session_state['total_pages']}ページです。先頭{MAX_PDF_PAGES}ページまでを処理します。")
+
+    config_signature = json.dumps(cfg, sort_keys=True, ensure_ascii=False)
+    run_signature = hashlib.sha256((file_hash + config_signature + token_text).encode("utf-8")).hexdigest()
+
+    if st.button("固定レイアウトでセルごとにOCRを実行", type="primary"):
+        try:
+            schedule_df, review_df = run_template_ocr(
+                images,
+                cfg,
+                allowed_tokens,
+            )
+            st.session_state["ocr_output"] = {
+                "signature": run_signature,
+                "schedule_df": schedule_df,
+                "review_df": review_df,
                 "filename": uploaded.name,
-                "total_pages": total_pages,
-                "processed_pages": processed_pages,
+                "total_pages": st.session_state.get("total_pages", len(images)),
+                "processed_pages": st.session_state.get("processed_pages", len(images)),
             }
         except Exception as exc:
-            st.error("OCR処理に失敗しました。Streamlit CloudのLogsで完全なエラー内容を確認してください。")
+            st.error("OCRに失敗しました。Streamlit CloudのLogsで詳細を確認してください。")
             st.exception(exc)
-            st.session_state["ocr_result_payload"] = None
+            st.session_state["ocr_output"] = None
 
-    payload = st.session_state.get("ocr_result_payload")
-    if payload and payload.get("signature") == dpi_signature:
-        if payload.get("total_pages", 1) > payload.get("processed_pages", 1):
-            st.warning(
-                f"全{payload['total_pages']}ページ中、先頭{payload['processed_pages']}ページのみ処理しました。"
-            )
-        with st.expander("原本プレビュー（先頭ページ）", expanded=False):
-            if payload.get("preview_image") is not None:
-                st.image(payload["preview_image"], use_container_width=True)
+    result = st.session_state.get("ocr_output")
+    if result is None or result.get("signature") != run_signature:
+        if result is not None:
+            st.info("テンプレート設定またはファイルが変わっています。最新の設定でOCRを再実行してください。")
+        return
 
-        schedule_df, review_df, page_layouts, line_summaries = build_schedule(
-            payload["detections"],
-            manual_day1_pct=float(manual_day1_pct),
-            manual_day31_pct=float(manual_day31_pct),
-            auto_detect=auto_detect,
-            allowed_tokens=allowed_tokens,
-        )
-        st.subheader("日付列の推定結果")
-        for page_no, method in page_layouts.items():
-            st.write(f"ページ {page_no}: {method}")
-        if auto_detect and any("手動指定" in method for method in page_layouts.values()):
-            st.warning("日付見出しを十分に検出できなかったため、手動設定の1日列・31日列から列位置を推定しました。必要なら上の%を調整し、再確認してください。")
+    schedule_df = result["schedule_df"].copy()
+    review_df = result["review_df"].copy()
+    st.subheader("3. 読み取った勤務シフト表（編集できます）")
+    st.caption("各日のセルを直接修正できます。誤認識、空欄、氏名の誤りを原本と照合してください。")
 
-        if schedule_df.empty:
-            st.error("勤務行を抽出できませんでした。原本プレビューとOCR確認をチェックし、列位置を調整してから再実行してください。")
-        else:
-            st.subheader("勤務シフト表（編集可能）")
-            st.caption("列は氏名と1日～31日です。誤認識や空欄は、ダウンロード前に表内で修正できます。")
-            token_signature = hashlib.sha1(token_text.encode("utf-8")).hexdigest()[:6]
-            editor_key = (
-                f"shift_editor_{signature[:12]}_{int(manual_day1_pct)}_"
-                f"{int(manual_day31_pct)}_{int(auto_detect)}_{token_signature}"
-            )
-            edited_schedule = st.data_editor(
-                schedule_df,
-                key=editor_key,
-                num_rows="dynamic",
-                hide_index=True,
-                use_container_width=True,
-                column_config={
-                    "氏名": st.column_config.TextColumn("氏名", required=True, width="medium"),
-                    **{f"{d}日": st.column_config.TextColumn(f"{d}日", width="small") for d in range(1, 32)},
-                },
-            )
+    editor_key = f"schedule_editor_{run_signature[:16]}"
+    edited_schedule = st.data_editor(
+        schedule_df,
+        key=editor_key,
+        num_rows="dynamic",
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "氏名": st.column_config.TextColumn("氏名", required=True, width="medium"),
+            **{f"{day}日": st.column_config.TextColumn(f"{day}日", width="small") for day in range(1, 32)},
+        },
+    )
 
-            low_count = 0
-            if not review_df.empty:
-                low_count = int((review_df["要確認"] == "要確認").sum())
-            m1, m2, m3 = st.columns(3)
-            m1.metric("抽出した職員行", len(edited_schedule))
-            m2.metric("OCR文字領域", len(payload["detections"]))
-            m3.metric("確認推奨のOCR領域", low_count)
+    review_count = 0
+    if not review_df.empty:
+        review_count = int((review_df["判定"] == "要確認").sum())
+    m1, m2, m3 = st.columns(3)
+    m1.metric("抽出した職員行", len(edited_schedule))
+    m2.metric("OCR確認セル", len(review_df))
+    m3.metric("要確認セル", review_count)
 
-            if not review_df.empty:
-                with st.expander("OCR確認情報（信頼度・座標・推定分類）", expanded=False):
-                    st.dataframe(review_df, use_container_width=True, hide_index=True)
+    if not review_df.empty:
+        with st.expander("OCR確認（低信頼度・認識結果・セル位置）", expanded=True):
+            st.dataframe(review_df, use_container_width=True, hide_index=True)
 
-            metadata = {
-                "対象年月": target_ym,
-                "施設名": facility_name.strip() or "（未入力）",
-                "元ファイル名": payload["filename"],
-                "処理日時": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "総ページ数": payload["total_pages"],
-                "処理ページ数": payload["processed_pages"],
-                "OCR方式": "PaddleOCR 2.10 / lang=japan",
-                "備考": "勤務シフト表シートは氏名＋1日～31日。OCR確認シートの結果は原本照合が必要です。",
-            }
-            excel_bytes = make_excel(edited_schedule[SCHEDULE_COLUMNS], review_df, metadata)
-            stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-            st.download_button(
-                "📥 氏名×1日～31日のExcelをダウンロード",
-                data=excel_bytes,
-                file_name=f"勤務シフト表_OCR_{stamp}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="primary",
-            )
-
-        if not review_df.empty:
-            with st.expander("OCRが検出したテキスト一覧", expanded=False):
-                st.dataframe(review_df[["ページ", "OCR行", "分類", "推定氏名", "推定日", "認識テキスト", "信頼度", "要確認"]], use_container_width=True, hide_index=True)
+    metadata = {
+        "対象年月": target_ym,
+        "施設名": facility_name.strip() or "（未入力）",
+        "元ファイル名": result["filename"],
+        "処理日時": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "総ページ数": result["total_pages"],
+        "処理ページ数": result["processed_pages"],
+        "OCR方式": "PaddleOCR 2.10 認識専用 + 固定テンプレートセル切り出し",
+        "テンプレート設定": json.dumps(cfg, ensure_ascii=False),
+        "勤務記号候補": ",".join(allowed_tokens),
+        "注意": "勤務シフト表は氏名＋1日～31日。必ず原本と照合してください。",
+    }
+    excel_bytes = make_excel(edited_schedule[SCHEDULE_COLUMNS], review_df, metadata)
+    stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    st.download_button(
+        "📥 氏名×1日～31日のExcelをダウンロード",
+        data=excel_bytes,
+        file_name=f"勤務シフト表_OCR_固定レイアウト_{stamp}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+    )
 
 
 if __name__ == "__main__":
